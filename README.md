@@ -164,7 +164,7 @@ The full trust boundary, threat model and reviewer confinement are documented in
 ## Known limitations
 
 - agy cannot disable its tools; tool use is detected after the fact and fails the run, which is why the agy reviewer is opt-in.
-- Dependency checks cover the npm and Go ecosystems only.
+- Dependency checks cover the npm, Go and Python ecosystems only.
 - Forbidden-pattern regexes use Python `re` without a timeout; very long lines are windowed and flagged.
 
 ## Development

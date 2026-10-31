@@ -177,3 +177,66 @@ def test_registry_specs_are_not_dependency_source(tmp_path: Path, spec: str) -> 
     (repo / "package.json").write_text(json.dumps(head, indent=2) + "\n")
     _, report = check(repo, tmp_path / "c.toml", tmp_path / "out")
     assert findings(report, "dependency-source") == []
+
+
+def test_pyproject_toml_allowed_and_unlisted_dependencies(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "p")
+    base_toml = """[project]
+name = "demo"
+dependencies = [
+    "requests>=2.28",
+]
+"""
+    (repo / "pyproject.toml").write_text(base_toml)
+    commit_all(repo)
+
+    head_toml = """[project]
+name = "demo"
+dependencies = [
+    "requests>=2.28",
+    "left-pad>=1.0",
+    "unapproved-pkg==0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+"""
+    (repo / "pyproject.toml").write_text(head_toml)
+    (tmp_path / "c.toml").write_text(CONTRACT)
+    code, report = check(repo, tmp_path / "c.toml", tmp_path / "out")
+    assert code == 1
+    unallowed = sorted(f["message"].split("'")[1] for f in findings(report, "dependency-not-allowed"))
+    assert unallowed == ["pytest", "unapproved-pkg"]
+
+
+def test_pyproject_toml_non_registry_source(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "p")
+    (repo / "pyproject.toml").write_text("[project]\nname = 'x'\ndependencies = []\n")
+    commit_all(repo)
+
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = 'x'\ndependencies = [\n    'left-pad @ git+https://github.com/example/left-pad.git',\n]\n"
+    )
+    (tmp_path / "c.toml").write_text(CONTRACT)
+    code, report = check(repo, tmp_path / "c.toml", tmp_path / "out")
+    assert code == 1
+    assert findings(report, "dependency-source")
+
+
+def test_requirements_txt_unlisted_and_source(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "req")
+    (repo / "requirements.txt").write_text("requests==2.31.0\n")
+    commit_all(repo)
+
+    (repo / "requirements.txt").write_text(
+        "requests==2.31.0\nleft-pad>=1.0\nunapproved-dep==1.0\npkg-tarball @ https://example.com/pkg.whl\n"
+    )
+    (tmp_path / "c.toml").write_text(CONTRACT)
+    code, report = check(repo, tmp_path / "c.toml", tmp_path / "out")
+    assert code == 1
+    assert "unapproved-dep" in [f["message"].split("'")[1] for f in findings(report, "dependency-not-allowed")]
+    assert findings(report, "dependency-source")
+
+

@@ -26,7 +26,8 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   (`contract.toml` / `.homework.toml`, optional task.md frontmatter).
   - scope: allowed/forbidden paths with own `**` glob matcher, symlink escapes, `required_paths`,
     forbidden regex patterns on added lines, contract self-modification;
-  - dependencies: unlisted `package.json` / `go.mod` additions, removals, version changes and key reordering;
+  - dependencies: unlisted `package.json` / `go.mod` / `pyproject.toml` / `requirements.txt` additions,
+    removals, version changes and key reordering;
   - test protection: deleted tests, skip/only markers, constant assertions, assertion-count drops;
   - ast-grep rule pack (pinned 0.51.0; ts/tsx separate): window `__*` hooks, e2e `setContent` /
     external URLs / DOM injection, static inline styles, `textTransform: uppercase`, commented-out code;

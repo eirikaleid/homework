@@ -1,10 +1,11 @@
-"""Dependency adapter: package.json / go.mod additions, removals and key reordering (G46-2)."""
+"""Dependency adapter: package.json / go.mod / pyproject.toml additions, removals and key reordering (G46-2)."""
 
 from __future__ import annotations
 
 import json
 import posixpath
 import re
+import tomllib
 from typing import Any
 
 from ..context import CheckContext
@@ -13,6 +14,7 @@ from ..models import AdapterResult, Finding, Severity
 
 NAME = "deps"
 DEP_SECTIONS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+PY_PEP621_SECTIONS = ("dependencies", "optional-dependencies")
 
 
 def _line_of(text: str, key: str) -> int | None:
@@ -296,6 +298,225 @@ def _go_work(ctx: CheckContext, fc: FileChange, res: AdapterResult) -> None:
         )
 
 
+_PY_PKG_NAME = re.compile(r"^([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)")
+
+
+def _parse_python_requirement(raw: str) -> tuple[str, str] | None:
+    clean = raw.split("#")[0].strip()
+    if not clean or clean.startswith(("-r", "--requirement", "-c", "--constraint", "-e", "--editable")):
+        return None
+    if "@" in clean:
+        parts = clean.split("@", 1)
+        name = parts[0].strip()
+        spec = "@ " + parts[1].strip()
+        name_clean = re.sub(r"\[.*\]", "", name).strip()
+        return (name_clean, spec)
+    m = re.split(r"(===|==|!=|~=|<=|>=|<|>)", clean, maxsplit=1)
+    if len(m) >= 3:
+        name = re.sub(r"\[.*\]", "", m[0]).strip()
+        spec = m[1] + m[2].strip()
+        return (name, spec)
+    name = re.sub(r"\[.*\]", "", clean).strip()
+    match = _PY_PKG_NAME.match(name)
+    if match:
+        return (match.group(1), "")
+    return None
+
+
+def _pyproject_toml(ctx: CheckContext, fc: FileChange, res: AdapterResult) -> None:
+    add = res.findings.append
+    allowed = set(ctx.contract.allowed_dependencies)
+    head_raw = ctx.changes.read_head(fc.path)
+    if head_raw is None:
+        return
+    head_text = head_raw.decode(errors="replace")
+    base_raw = ctx.changes.read_base(fc.old_path or fc.path) if fc.status != "A" else None
+    base_text = base_raw.decode(errors="replace") if base_raw else ""
+
+    try:
+        head = tomllib.loads(head_text)
+        base = tomllib.loads(base_text) if base_text else {}
+    except tomllib.TOMLDecodeError as exc:
+        add(
+            Finding(
+                "pyproject-toml-invalid",
+                Severity.ERROR,
+                f"pyproject.toml is not valid TOML: {exc}",
+                file=fc.path,
+                adapter=NAME,
+            )
+        )
+        return
+
+    def collect_deps(data: dict[str, Any]) -> dict[str, dict[str, str]]:
+        collected: dict[str, dict[str, str]] = {}
+        project = data.get("project")
+        if isinstance(project, dict):
+            deps = project.get("dependencies")
+            if isinstance(deps, list):
+                sec_map: dict[str, str] = {}
+                for item in deps:
+                    if isinstance(item, str):
+                        parsed = _parse_python_requirement(item)
+                        if parsed:
+                            sec_map[parsed[0]] = parsed[1]
+                collected["project.dependencies"] = sec_map
+
+            opt_deps = project.get("optional-dependencies")
+            if isinstance(opt_deps, dict):
+                for group, items in opt_deps.items():
+                    if isinstance(items, list):
+                        sec_map = {}
+                        for item in items:
+                            if isinstance(item, str):
+                                parsed = _parse_python_requirement(item)
+                                if parsed:
+                                    sec_map[parsed[0]] = parsed[1]
+                        collected[f"project.optional-dependencies.{group}"] = sec_map
+
+        dep_groups = data.get("dependency-groups")
+        if isinstance(dep_groups, dict):
+            for group, items in dep_groups.items():
+                if isinstance(items, list):
+                    sec_map = {}
+                    for item in items:
+                        if isinstance(item, str):
+                            parsed = _parse_python_requirement(item)
+                            if parsed:
+                                sec_map[parsed[0]] = parsed[1]
+                    collected[f"dependency-groups.{group}"] = sec_map
+
+        return collected
+
+    base_deps = collect_deps(base)
+    head_deps = collect_deps(head)
+
+    all_sections = sorted(set(base_deps.keys()) | set(head_deps.keys()))
+    for sec in all_sections:
+        b = base_deps.get(sec, {})
+        h = head_deps.get(sec, {})
+        for name, spec in h.items():
+            line = next((n for n, t in fc.added.items() if name in t), None)
+            if (name not in b or b[name] != spec) and not _registry_spec(spec.lstrip("@ ")):
+                add(
+                    Finding(
+                        "dependency-source",
+                        Severity.ERROR,
+                        f"Python dependency '{name}' in {sec} is installed from a non-registry source; "
+                        "use a standard package version.",
+                        file=fc.path,
+                        line=line,
+                        evidence=f"{name} {spec}".strip(),
+                        adapter=NAME,
+                    )
+                )
+            if name not in b and name not in allowed:
+                add(
+                    Finding(
+                        "dependency-not-allowed",
+                        Severity.ERROR,
+                        f"New Python dependency '{name}' in {sec} is not in allowed_dependencies; remove it.",
+                        file=fc.path,
+                        line=line,
+                        evidence=f"{name} {spec}".strip(),
+                        adapter=NAME,
+                    )
+                )
+            elif name in b and b[name] != spec:
+                add(
+                    Finding(
+                        "dependency-changed",
+                        Severity.WARNING,
+                        f"Version of '{name}' in {sec} changed ({b[name]} -> {spec}); "
+                        "restore the original version.",
+                        file=fc.path,
+                        line=line,
+                        adapter=NAME,
+                    )
+                )
+        for name in b:
+            if name not in h:
+                add(
+                    Finding(
+                        "dependency-removed",
+                        Severity.WARNING,
+                        f"Python dependency '{name}' was removed from {sec}; restore it.",
+                        file=fc.path,
+                        adapter=NAME,
+                    )
+                )
+
+
+def _requirements_txt(ctx: CheckContext, fc: FileChange, res: AdapterResult) -> None:
+    add = res.findings.append
+    allowed = set(ctx.contract.allowed_dependencies)
+    head_text = (ctx.changes.read_head(fc.path) or b"").decode(errors="replace")
+    raw_base = ctx.changes.read_base(fc.old_path or fc.path) if fc.status != "A" else None
+    base_text = (raw_base or b"").decode(errors="replace")
+
+    def parse_lines(text: str) -> dict[str, str]:
+        deps: dict[str, str] = {}
+        for line in text.splitlines():
+            parsed = _parse_python_requirement(line)
+            if parsed:
+                deps[parsed[0]] = parsed[1]
+        return deps
+
+    base_deps = parse_lines(base_text)
+    head_deps = parse_lines(head_text)
+
+    for name, spec in head_deps.items():
+        line = next((n for n, t in fc.added.items() if name in t), None)
+        if (name not in base_deps or base_deps[name] != spec) and not _registry_spec(spec.lstrip("@ ")):
+            add(
+                Finding(
+                    "dependency-source",
+                    Severity.ERROR,
+                    f"Python dependency '{name}' is installed from a non-registry source; "
+                    "use a standard package version.",
+                    file=fc.path,
+                    line=line,
+                    evidence=f"{name} {spec}".strip(),
+                    adapter=NAME,
+                )
+            )
+        if name not in base_deps and name not in allowed:
+            add(
+                Finding(
+                    "dependency-not-allowed",
+                    Severity.ERROR,
+                    f"New Python dependency '{name}' is not in allowed_dependencies; remove it.",
+                    file=fc.path,
+                    line=line,
+                    evidence=f"{name} {spec}".strip(),
+                    adapter=NAME,
+                )
+            )
+        elif name in base_deps and base_deps[name] != spec:
+            add(
+                Finding(
+                    "dependency-changed",
+                    Severity.WARNING,
+                    f"Version of '{name}' changed ({base_deps[name]} -> {spec}); "
+                    "restore the original version.",
+                    file=fc.path,
+                    line=line,
+                    adapter=NAME,
+                )
+            )
+    for name in base_deps:
+        if name not in head_deps:
+            add(
+                Finding(
+                    "dependency-removed",
+                    Severity.WARNING,
+                    f"Python dependency '{name}' was removed; restore it.",
+                    file=fc.path,
+                    adapter=NAME,
+                )
+            )
+
+
 def run(ctx: CheckContext) -> AdapterResult:
     res = AdapterResult(NAME, "ran")
     for fc in ctx.changes.files:
@@ -308,4 +529,9 @@ def run(ctx: CheckContext) -> AdapterResult:
             _go_mod(ctx, fc, res)
         elif base == "go.work":
             _go_work(ctx, fc, res)
+        elif base == "pyproject.toml":
+            _pyproject_toml(ctx, fc, res)
+        elif base == "requirements.txt" or (base.startswith("requirements") and base.endswith(".txt")):
+            _requirements_txt(ctx, fc, res)
     return res
+
